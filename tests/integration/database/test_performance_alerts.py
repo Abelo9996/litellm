@@ -5,6 +5,7 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Final
 
 import psycopg
@@ -22,6 +23,7 @@ from litellm.repositories.alert_repository import AlertRepository
 from litellm.repositories.performance_alert_repository import PerformanceAlertRepository
 from tests.integration._support.client import Gateway
 from tests.integration._support.database import read_rows, write_rows
+from tests.integration._support.process import owned_proxy
 
 DAY: Final = date(2026, 1, 8)
 NOW: Final = datetime(2026, 1, 9, 2, 0, tzinfo=timezone.utc)
@@ -274,23 +276,33 @@ async def test_retries_status_changes_deletion_and_reconnect_do_not_restore_allo
 
 
 @pytest.mark.asyncio
-async def test_opt_out_is_shared_and_config_false_cannot_be_overridden(fixture: Fixture, gateway: Gateway) -> None:
-    response: Final = gateway.request("GET", "/alerts/monitoring")
-    assert response.status_code == 200, response.text
-    assert response.json() == {"enabled": True, "alerts_used": 0, "alert_limit": 5, "disabled_by_config": False}
-    claim: Final = await fixture.repository.claim(timedelta(0))
-    assert claim is not None
-    disabled: Final = gateway.request("PATCH", "/alerts/monitoring", {"enabled": False})
-    assert disabled.status_code == 200, disabled.text
-    assert disabled.json()["enabled"] is False
-    assert await fixture.repository.claim(timedelta(0)) is None
-    assert await fixture.repository.evaluate_page(claim.owner, SweepState(day=DAY), 25) is None
-    enabled: Final = gateway.request("PATCH", "/alerts/monitoring", {"enabled": True})
-    assert enabled.status_code == 200, enabled.text
-    assert (await fixture.repository.monitoring()).enabled
-    configured_off: Final = PerformanceAlertRepository(fixture.client, configured=False)
-    assert not (await configured_off.set_enabled(True)).enabled
-    assert await configured_off.claim(timedelta(0)) is None
+@pytest.mark.shares_worker_state
+async def test_opt_out_is_shared_and_config_false_cannot_be_overridden(
+    fixture: Fixture, gateway: Gateway, tmp_path: Path
+) -> None:
+    with owned_proxy(gateway, tmp_path, {}, remove_environment=("LITELLM_LICENSE",)) as unlicensed:
+        response: Final = unlicensed.request("GET", "/alerts/monitoring")
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "enabled": True,
+            "model_deprecations_enabled": True,
+            "alerts_used": 0,
+            "alert_limit": 5,
+            "disabled_by_config": False,
+        }
+        claim: Final = await fixture.repository.claim(timedelta(0))
+        assert claim is not None
+        disabled: Final = unlicensed.request("PATCH", "/alerts/monitoring", {"enabled": False})
+        assert disabled.status_code == 200, disabled.text
+        assert disabled.json()["enabled"] is False
+        assert await fixture.repository.claim(timedelta(0)) is None
+        assert await fixture.repository.evaluate_page(claim.owner, SweepState(day=DAY), 25) is None
+        enabled: Final = unlicensed.request("PATCH", "/alerts/monitoring", {"enabled": True})
+        assert enabled.status_code == 200, enabled.text
+        assert (await fixture.repository.monitoring()).enabled
+        configured_off: Final = PerformanceAlertRepository(fixture.client, configured=False)
+        assert not (await configured_off.set_enabled(True)).enabled
+        assert await configured_off.claim(timedelta(0)) is None
 
 
 @pytest.mark.asyncio
