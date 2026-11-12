@@ -300,6 +300,15 @@ def create(
             )
         else:
             custom_llm_provider = custom_llm_provider or "gemini"
+        if agent and model and model != agent:
+            raise litellm.BadRequestError(
+                message=(
+                    f"agent '{agent}' can only run on a deployment of that agent, but the model is '{model}'. "
+                    "Configure a deployment whose model is the agent and send its model group."
+                ),
+                model=model,
+                llm_provider=custom_llm_provider,
+            )
 
         interactions_api_config: Final = get_provider_interactions_api_config(
             provider=custom_llm_provider,

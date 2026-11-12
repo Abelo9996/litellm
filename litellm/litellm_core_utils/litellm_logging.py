@@ -8067,17 +8067,10 @@ def get_standard_logging_object_payload(
         # built, so cost-map lookup via that alias misses and the deployment model stands in for base_model.
         # A PTU request Azure spilled onto pay-as-you-go capacity is billed at the served model's rates,
         # which the deployment's zeroed PTU entry would misreport, so that fallback is skipped there.
-        custom_pricing: Final = False if spilled_over else logging_obj.custom_pricing_for(init_response_obj)
-        priced_by_agent: Final = (
-            not custom_pricing
-            and isinstance(init_response_obj, InteractionsAPIResponse)
-            and bool(init_response_obj.agent)
-        )
         base_model: Final = (
-            metadata.get("deployment")
-            if configured_base_model is None and not spilled_over and not priced_by_agent
-            else configured_base_model
+            metadata.get("deployment") if configured_base_model is None and not spilled_over else configured_base_model
         )
+        custom_pricing: Final = False if spilled_over else logging_obj.custom_pricing_for(init_response_obj)
         raw_response_cost: Final = kwargs.get("response_cost")
         numeric_response_cost: Final = raw_response_cost if isinstance(raw_response_cost, int | float) else None
         priced_response_cost: Final = finite_cost(numeric_response_cost)

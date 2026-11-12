@@ -308,13 +308,13 @@ class TestGoogleInteractionsCreate:
                 id="agent-keeps-an-object",
             ),
             pytest.param(
-                {"model": "gemini/gemini-2.5-flash", "agent": "antigravity-preview-09-2026"},
+                {"model": "gemini/antigravity-preview-09-2026", "agent": "antigravity-preview-09-2026"},
                 {"type": "antigravity", "model": "gemini-3.8-flash"},
                 {
                     "agent": "antigravity-preview-09-2026",
                     "agent_config": {"type": "antigravity", "model": "gemini-3.8-flash"},
                 },
-                id="model-and-agent-sends-the-agent-with-its-config",
+                id="matching-model-and-agent-sends-the-agent-with-its-config",
             ),
             pytest.param(
                 {"agent": "antigravity-preview-09-2026"},
@@ -357,6 +357,18 @@ class TestGoogleInteractionsCreate:
         )
 
         assert json.loads(route.calls.last.request.content) == {**expected_target, "input": "Say hi in one word."}
+
+    @pytest.mark.usefixtures("fake_provider_credentials")
+    def test_create_refuses_an_agent_with_another_model_before_any_http_call(self, respx_mock: MockRouter) -> None:
+        with pytest.raises(litellm.BadRequestError, match="antigravity-preview-09-2026"):
+            interactions.create(
+                model="gemini/gemini-2.5-flash",
+                agent="antigravity-preview-09-2026",
+                input="Say hi in one word.",
+                api_key="gemini-offline",
+            )
+
+        assert not respx_mock.calls
 
     @pytest.mark.usefixtures("fake_provider_credentials")
     def test_create_rejects_agent_config_a_bridged_provider_cannot_take(self, respx_mock: MockRouter) -> None:
@@ -958,10 +970,23 @@ def _deep_research_cost_from_the_vertex_row() -> float:
     )
 
 
+class _LoggedModelMapValue(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    key: str
+
+
+class _LoggedModelMap(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    model_map_value: _LoggedModelMapValue
+
+
 class _LoggedModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     model: str
+    model_map_information: _LoggedModelMap
 
 
 class _LoggedCost(BaseModel):
@@ -984,26 +1009,35 @@ class _CostRecorder(CustomLogger):
         self.logged.set()
 
 
+_DEEP_RESEARCH_INTERACTION: Final = {
+    "id": "interaction-dr",
+    "object": "interaction",
+    "agent": _DEEP_RESEARCH_AGENT,
+    "status": "completed",
+    "usage": _DEEP_RESEARCH_USAGE,
+}
+_DEEP_RESEARCH_URL: Final = (
+    "https://aiplatform.googleapis.com/v1beta1/projects/dr-project/locations/global/interactions"
+)
+
+
+def _deep_research_reply(stream: bool) -> httpx.Response:
+    if not stream:
+        return httpx.Response(200, json=_DEEP_RESEARCH_INTERACTION)
+    completed: Final = json.dumps({"event_type": "interaction.completed", "interaction": _DEEP_RESEARCH_INTERACTION})
+    return httpx.Response(200, text=f"data: {completed}\n\n", headers={"content-type": "text/event-stream"})
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["background-or-foreground", "streamed"])
 @pytest.mark.asyncio
 async def test_an_agent_only_vertex_deep_research_interaction_is_billed_under_the_agent_row(
-    respx_mock: MockRouter, monkeypatch: pytest.MonkeyPatch
+    respx_mock: MockRouter, monkeypatch: pytest.MonkeyPatch, stream: bool
 ) -> None:
     recorder: Final = _CostRecorder()
     monkeypatch.setattr(litellm, "callbacks", [recorder])
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
-    route: Final = respx_mock.post(
-        "https://aiplatform.googleapis.com/v1beta1/projects/dr-project/locations/global/interactions"
-    ).mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "id": "interaction-dr",
-                "object": "interaction",
-                "agent": _DEEP_RESEARCH_AGENT,
-                "status": "completed",
-                "usage": _DEEP_RESEARCH_USAGE,
-            },
-        )
+    route: Final = respx_mock.post(f"{_DEEP_RESEARCH_URL}?alt=sse" if stream else _DEEP_RESEARCH_URL).mock(
+        return_value=_deep_research_reply(stream)
     )
     credentials: Final = {
         "type": "authorized_user",
@@ -1017,20 +1051,28 @@ async def test_an_agent_only_vertex_deep_research_interaction_is_billed_under_th
             "https://oauth2.googleapis.com/token",
             json={"access_token": "dr-token", "expires_in": 3600, "token_type": "Bearer"},
         )
-        await interactions.acreate(
+        response: Final = await interactions.acreate(
             agent=_DEEP_RESEARCH_AGENT,
             input="Compare grid-scale storage options.",
             custom_llm_provider="vertex_ai",
             vertex_project="dr-project",
             vertex_location="global",
             vertex_credentials=json.dumps(credentials),
+            stream=stream,
         )
+        if stream:
+            async for _ in response:
+                pass
         await asyncio.wait_for(recorder.logged.wait(), timeout=10)
 
     assert json.loads(route.calls.last.request.content) == {
         "agent": _DEEP_RESEARCH_AGENT,
         "input": "Compare grid-scale storage options.",
+        **({"stream": True} if stream else {}),
     }
     assert recorder.cost is not None
     assert recorder.cost.standard_logging_object.model == _DEEP_RESEARCH_AGENT
+    assert recorder.cost.standard_logging_object.model_map_information.model_map_value.key == (
+        f"vertex_ai/{_DEEP_RESEARCH_AGENT}"
+    )
     assert recorder.cost.response_cost == pytest.approx(_deep_research_cost_from_the_vertex_row())

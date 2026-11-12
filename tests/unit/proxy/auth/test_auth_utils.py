@@ -2003,6 +2003,34 @@ def test_get_model_from_request_nvidia_nim_relay_without_a_router_has_no_model()
     assert get_model_from_request(request_data=NIM_INFER_BODY, route="/nvidia_nim/nim-page-elements/v1/infer") is None
 
 
+@pytest.mark.parametrize(
+    ("route", "selector", "authorized_as"),
+    [
+        pytest.param("/v1beta/interactions/abc", "beta-id", "beta", id="deployment-id-authorizes-its-group"),
+        pytest.param("/v1beta/interactions/abc/cancel", "beta", "beta", id="group-name-wins-over-a-same-named-id"),
+        pytest.param("/interactions/abc", "no-such-id", "no-such-id", id="unknown-id-stays-as-sent"),
+        pytest.param("/v1/files", "beta-id", "beta-id", id="other-routes-keep-the-raw-selector"),
+    ],
+)
+def test_get_model_from_request_authorizes_an_interaction_deployment_id_selector_as_its_group(
+    route: str, selector: str, authorized_as: str
+) -> None:
+    router: Final = Router(
+        model_list=[
+            {"model_name": "alpha", "litellm_params": {"model": "openai/gpt-5.6"}, "model_info": {"id": "beta"}},
+            {"model_name": "beta", "litellm_params": {"model": "openai/gpt-5.6"}, "model_info": {"id": "beta-id"}},
+        ]
+    )
+
+    for params, headers in (({"model": selector}, None), (None, {"x-litellm-model": selector})):
+        assert (
+            get_model_from_request(
+                request_data={}, route=route, request_query_params=params, request_headers=headers, llm_router=router
+            )
+            == authorized_as
+        )
+
+
 def test_get_model_from_request_includes_file_endpoint_header_model():
     assert (
         get_model_from_request(

@@ -5,7 +5,9 @@ Test for google_endpoints/endpoints.py
 import asyncio
 import json
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final
 
 import httpx
@@ -14,13 +16,12 @@ import responses
 import respx
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
+from pydantic import JsonValue, ValidationError
 from starlette.requests import Request
 from starlette.responses import Response
 
 import litellm
-from litellm.integrations.custom_logger import CustomLogger
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import LiteLLM_TeamTableCachedObj, UserAPIKeyAuth
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.google_endpoints.endpoints import _google_count_tokens_request, google_count_tokens
 from litellm.types.llms.vertex_ai import TokenCountDetailsResponse
@@ -210,6 +211,8 @@ _INTERACTION_ID: Final = "abc123"
 _VERTEX_GROUP: Final = "vertex-argon"
 _VERTEX_DEEP_RESEARCH_GROUP: Final = "vertex-dr"
 _DEEP_RESEARCH_AGENT: Final = "deep-research-preview-04-2026"
+_SPLIT_GROUP: Final = "vertex-split"
+_SPLIT_DEPLOYMENTS: Final = MappingProxyType({"split-east": "east-project", "split-west": "west-project"})
 _VERTEX_COLLECTION_URL: Final = (
     "https://aiplatform.googleapis.com/v1beta1/projects/deployment-project/locations/global/interactions"
 )
@@ -224,7 +227,13 @@ _BY_ID_CALLS: Final = (
 _BY_ID_ROUTES: Final = tuple((method, path) for method, path, _ in _BY_ID_CALLS)
 
 
-def _vertex_deployment(model_name: str, model: str) -> Mapping[str, object]:
+def _vertex_deployment(
+    model_name: str,
+    model: str,
+    project: str = "deployment-project",
+    deployment_id: str | None = None,
+    order: int | None = None,
+) -> Mapping[str, object]:
     credentials: Final = {
         "type": "authorized_user",
         "client_id": "deployment-client",
@@ -236,38 +245,47 @@ def _vertex_deployment(model_name: str, model: str) -> Mapping[str, object]:
         "model_name": model_name,
         "litellm_params": {
             "model": model,
-            "vertex_project": "deployment-project",
+            "vertex_project": project,
             "vertex_location": "global",
             "vertex_credentials": json.dumps(credentials),
+            **({"order": order} if order is not None else {}),
         },
+        **({"model_info": {"id": deployment_id}} if deployment_id is not None else {}),
     }
 
 
 @pytest.fixture
-def interactions_proxy(httpx_transport: None, fake_provider_credentials: None) -> Iterator[TestClient]:
+def google_oauth() -> Iterator[responses.RequestsMock]:
+    with responses.RequestsMock(assert_all_requests_are_fired=False) as token_endpoint:
+        token_endpoint.post(
+            "https://oauth2.googleapis.com/token",
+            json={"access_token": "deployment-token", "expires_in": 3600, "token_type": "Bearer"},
+        )
+        yield token_endpoint
+
+
+@pytest.fixture
+def interactions_proxy(
+    httpx_transport: None, fake_provider_credentials: None, google_oauth: responses.RequestsMock
+) -> Iterator[TestClient]:
     from litellm.proxy import proxy_server
 
     router: Final = litellm.Router(
         model_list=[
             _vertex_deployment(_VERTEX_GROUP, "vertex_ai/gemini-4-argon"),
             _vertex_deployment(_VERTEX_DEEP_RESEARCH_GROUP, f"vertex_ai/{_DEEP_RESEARCH_AGENT}"),
+            _vertex_deployment(_SPLIT_GROUP, "vertex_ai/gemini-4-argon", "east-project", "split-east", order=1),
+            _vertex_deployment(_SPLIT_GROUP, "vertex_ai/gemini-4-argon", "west-project", "split-west", order=2),
         ]
     )
     proxy_server.cleanup_router_config_variables()
     try:
-        with (
-            pytest.MonkeyPatch.context() as proxy_globals,
-            responses.RequestsMock(assert_all_requests_are_fired=False) as google_oauth,
-        ):
+        with pytest.MonkeyPatch.context() as proxy_globals:
             proxy_globals.setattr(proxy_server, "llm_router", None)
             config_path: Final = Path(__file__).parents[1] / "test_configs" / "test_config_no_auth.yaml"
             asyncio.run(proxy_server.initialize(config=str(config_path)))
             config_router: Final = proxy_server.llm_router
             proxy_globals.setattr(proxy_server, "llm_router", router)
-            google_oauth.post(
-                "https://oauth2.googleapis.com/token",
-                json={"access_token": "deployment-token", "expires_in": 3600, "token_type": "Bearer"},
-            )
             client: Final = TestClient(proxy_server.app)
             try:
                 yield client
@@ -278,6 +296,24 @@ def interactions_proxy(httpx_transport: None, fake_provider_credentials: None) -
     finally:
         router.retire()
         proxy_server.cleanup_router_config_variables()
+
+
+@contextmanager
+def _cached_key(key: UserAPIKeyAuth, *teams: LiteLLM_TeamTableCachedObj) -> Iterator[str]:
+    from litellm.proxy import proxy_server
+
+    user_key: Final = "sk-cached-test-key"
+    user_api_key_cache: Final = UserApiKeyCache()
+    user_api_key_cache.set_cache(
+        key=proxy_server.hash_token(user_key), value=key.model_copy(update={"token": proxy_server.hash_token(user_key)})
+    )
+    for team in teams:
+        user_api_key_cache.set_cache(key=f"team_id:{team.team_id}", value=team)
+    with pytest.MonkeyPatch.context() as key_auth:
+        key_auth.setattr(proxy_server, "user_api_key_cache", user_api_key_cache)
+        key_auth.setattr(proxy_server, "master_key", MASTER_KEY)
+        key_auth.setattr(proxy_server, "prisma_client", "no-db-needed-for-a-cached-key")
+        yield f"Bearer {user_key}"
 
 
 def _selected(selector: str) -> tuple[Mapping[str, str], Mapping[str, str]]:
@@ -355,22 +391,11 @@ def test_interaction_by_id_naming_a_model_the_key_cannot_call_is_refused_before_
     method: str,
     path: str,
 ) -> None:
-    from litellm.proxy import proxy_server
-
-    user_key: Final = "sk-other-models-only"
-    user_api_key_cache: Final = UserApiKeyCache()
-    user_api_key_cache.set_cache(
-        key=proxy_server.hash_token(user_key),
-        value=UserAPIKeyAuth(token=proxy_server.hash_token(user_key), models=["some-other-group"]),
-    )
     params, headers = _selected(selector)
 
-    with pytest.MonkeyPatch.context() as key_auth:
-        key_auth.setattr(proxy_server, "user_api_key_cache", user_api_key_cache)
-        key_auth.setattr(proxy_server, "master_key", MASTER_KEY)
-        key_auth.setattr(proxy_server, "prisma_client", "no-db-needed-for-a-cached-key")
+    with _cached_key(UserAPIKeyAuth(models=["some-other-group"])) as authorization:
         response: Final = interactions_proxy.request(
-            method, path, params=params, headers={**headers, "authorization": f"Bearer {user_key}"}
+            method, path, params=params, headers={**headers, "authorization": authorization}
         )
 
     assert response.status_code == 403, response.text
@@ -400,54 +425,12 @@ def _deep_research_cost_from_the_vertex_row() -> float:
     )
 
 
-class _LoggedRates(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="ignore")
-
-    key: str
-    input_cost_per_token: float
-    cache_read_input_token_cost: float
-    output_cost_per_token: float
+def _deep_research_create(model_group: str) -> Mapping[str, str]:
+    return {"model": model_group, "agent": _DEEP_RESEARCH_AGENT, "input": "Compare grid-scale storage options."}
 
 
-class _LoggedModelMap(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="ignore")
-
-    model_map_value: _LoggedRates
-
-
-class _LoggedPayload(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="ignore")
-
-    model: str
-    model_map_information: _LoggedModelMap
-
-
-class _PayloadRecorder(CustomLogger):
-    def __init__(self) -> None:
-        super().__init__()
-        self.logged: Final = asyncio.Event()
-        self.payload: _LoggedPayload | None = None
-
-    async def async_log_success_event(
-        self, kwargs: Mapping[str, object], response_obj: object, start_time: object, end_time: object
-    ) -> None:
-        self.payload = _LoggedPayload.model_validate(kwargs["standard_logging_object"])
-        self.logged.set()
-
-
-@pytest.mark.parametrize(
-    ("model_group", "deployment_model"),
-    (
-        (_VERTEX_DEEP_RESEARCH_GROUP, f"vertex_ai/{_DEEP_RESEARCH_AGENT}"),
-        (_VERTEX_GROUP, "vertex_ai/gemini-4-argon"),
-    ),
-)
-@pytest.mark.asyncio
-async def test_routed_create_with_an_agent_sends_the_agent_with_the_deployment_credentials_and_bills_the_agent(
-    interactions_proxy: TestClient, respx_mock: respx.MockRouter, model_group: str, deployment_model: str
-) -> None:
-    recorder: Final = _PayloadRecorder()
-    upstream: Final = respx_mock.post(_VERTEX_COLLECTION_URL).mock(
+def _completed_deep_research(respx_mock: respx.MockRouter) -> respx.Route:
+    return respx_mock.post(_VERTEX_COLLECTION_URL).mock(
         return_value=httpx.Response(
             200,
             json={
@@ -460,20 +443,15 @@ async def test_routed_create_with_an_agent_sends_the_agent_with_the_deployment_c
         )
     )
 
-    with pytest.MonkeyPatch.context() as callbacks:
-        callbacks.setattr(litellm, "callbacks", [recorder])
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=interactions_proxy.app), base_url="http://testserver"
-        ) as client:
-            response: Final = await client.post(
-                "/v1beta/interactions",
-                json={
-                    "model": model_group,
-                    "agent": _DEEP_RESEARCH_AGENT,
-                    "input": "Compare grid-scale storage options.",
-                },
-            )
-            await asyncio.wait_for(recorder.logged.wait(), timeout=10)
+
+def test_routed_create_with_an_agent_sends_the_agent_with_the_deployment_credentials_and_bills_the_agent(
+    interactions_proxy: TestClient, respx_mock: respx.MockRouter
+) -> None:
+    upstream: Final = _completed_deep_research(respx_mock)
+
+    response: Final = interactions_proxy.post(
+        "/v1beta/interactions", json=_deep_research_create(_VERTEX_DEEP_RESEARCH_GROUP)
+    )
 
     assert response.status_code == 200, response.text
     assert json.loads(upstream.calls.last.request.content) == {
@@ -484,15 +462,77 @@ async def test_routed_create_with_an_agent_sends_the_agent_with_the_deployment_c
     assert float(response.headers["x-litellm-response-cost"]) == pytest.approx(
         _deep_research_cost_from_the_vertex_row()
     )
-    agent_row: Final = litellm.model_cost[f"vertex_ai/{_DEEP_RESEARCH_AGENT}"]
-    assert recorder.payload is not None
-    assert recorder.payload.model == deployment_model
-    assert recorder.payload.model_map_information.model_map_value == _LoggedRates(
-        key=f"vertex_ai/{_DEEP_RESEARCH_AGENT}",
-        input_cost_per_token=agent_row["input_cost_per_token"],
-        cache_read_input_token_cost=agent_row["cache_read_input_token_cost"],
-        output_cost_per_token=agent_row["output_cost_per_token"],
-    )
+
+
+def test_routed_create_with_an_agent_on_another_models_deployment_is_refused_before_any_upstream_call(
+    interactions_proxy: TestClient, respx_mock: respx.MockRouter, google_oauth: responses.RequestsMock
+) -> None:
+    response: Final = interactions_proxy.post("/v1beta/interactions", json=_deep_research_create(_VERTEX_GROUP))
+
+    assert response.status_code == 400, response.text
+    assert _DEEP_RESEARCH_AGENT in response.text
+    assert not respx_mock.calls
+    assert not google_oauth.calls
+
+
+def test_a_key_allowed_the_agent_deployment_runs_the_agent(
+    interactions_proxy: TestClient, respx_mock: respx.MockRouter
+) -> None:
+    upstream: Final = _completed_deep_research(respx_mock)
+
+    with _cached_key(UserAPIKeyAuth(models=[_VERTEX_DEEP_RESEARCH_GROUP])) as authorization:
+        response: Final = interactions_proxy.post(
+            "/v1beta/interactions",
+            json=_deep_research_create(_VERTEX_DEEP_RESEARCH_GROUP),
+            headers={"authorization": authorization},
+        )
+
+    assert response.status_code == 200, response.text
+    assert json.loads(upstream.calls.last.request.content)["agent"] == _DEEP_RESEARCH_AGENT
+
+
+@pytest.mark.parametrize(
+    ("key", "teams", "model_group", "status_code"),
+    (
+        pytest.param(
+            UserAPIKeyAuth(models=[_VERTEX_GROUP]), (), _VERTEX_GROUP, 400, id="own-group-cannot-run-another-agent"
+        ),
+        pytest.param(
+            UserAPIKeyAuth(models=[_VERTEX_GROUP]), (), _VERTEX_DEEP_RESEARCH_GROUP, 403, id="agent-group-not-on-key"
+        ),
+        pytest.param(
+            UserAPIKeyAuth(models=[_VERTEX_DEEP_RESEARCH_GROUP]),
+            (),
+            _VERTEX_GROUP,
+            403,
+            id="other-group-not-on-key",
+        ),
+        pytest.param(
+            UserAPIKeyAuth(team_id="team-without-deep-research"),
+            (LiteLLM_TeamTableCachedObj(team_id="team-without-deep-research", models=[_VERTEX_GROUP]),),
+            _VERTEX_DEEP_RESEARCH_GROUP,
+            403,
+            id="agent-group-not-on-team",
+        ),
+    ),
+)
+def test_a_restricted_key_cannot_run_an_agent_it_was_not_given_the_deployment_for(
+    interactions_proxy: TestClient,
+    respx_mock: respx.MockRouter,
+    google_oauth: responses.RequestsMock,
+    key: UserAPIKeyAuth,
+    teams: tuple[LiteLLM_TeamTableCachedObj, ...],
+    model_group: str,
+    status_code: int,
+) -> None:
+    with _cached_key(key, *teams) as authorization:
+        response: Final = interactions_proxy.post(
+            "/v1beta/interactions", json=_deep_research_create(model_group), headers={"authorization": authorization}
+        )
+
+    assert response.status_code == status_code, response.text
+    assert not respx_mock.calls
+    assert not google_oauth.calls
 
 
 def test_routed_create_without_an_agent_still_sends_the_deployment_model(
@@ -507,3 +547,112 @@ def test_routed_create_without_an_agent_still_sends_the_deployment_model(
     assert response.status_code == 200, response.text
     assert json.loads(upstream.calls.last.request.content) == {"model": "gemini-4-argon", "input": "Hi"}
     assert upstream.calls.last.request.headers["authorization"] == "Bearer deployment-token"
+
+
+def _project_url(project: str) -> str:
+    return f"https://aiplatform.googleapis.com/v1beta1/projects/{project}/locations/global/interactions"
+
+
+def _deployment_selector(selector: str, deployment_id: str) -> tuple[Mapping[str, str], Mapping[str, str]]:
+    match selector:
+        case "query":
+            return {"model": deployment_id}, {}
+        case "header":
+            return {}, {"x-litellm-model": deployment_id}
+        case _:
+            raise AssertionError(selector)
+
+
+@pytest.mark.respx(assert_all_called=False)
+@pytest.mark.parametrize("selector", ("query", "header"))
+@pytest.mark.parametrize(("method", "path", "upstream_suffix"), _BY_ID_CALLS)
+def test_a_follow_up_by_the_created_deployment_id_reaches_the_project_that_holds_the_interaction(
+    interactions_proxy: TestClient,
+    respx_mock: respx.MockRouter,
+    selector: str,
+    method: str,
+    path: str,
+    upstream_suffix: str,
+) -> None:
+    created: Final = MappingProxyType(
+        {
+            project: respx_mock.post(_project_url(project)).mock(
+                return_value=httpx.Response(
+                    200, json={"id": _INTERACTION_ID, "object": "interaction", "status": "completed"}
+                )
+            )
+            for project in _SPLIT_DEPLOYMENTS.values()
+        }
+    )
+    followed_up: Final = MappingProxyType(
+        {
+            project: respx_mock.request(method, f"{_project_url(project)}/{_INTERACTION_ID}{upstream_suffix}").mock(
+                return_value=httpx.Response(200, json=_INTERACTION)
+            )
+            for project in _SPLIT_DEPLOYMENTS.values()
+        }
+    )
+
+    create: Final = interactions_proxy.post("/v1beta/interactions", json={"model": _SPLIT_GROUP, "input": "Hi"})
+    deployment_id: Final = create.headers["x-litellm-model-id"]
+    project: Final = _SPLIT_DEPLOYMENTS[deployment_id]
+    params, headers = _deployment_selector(selector, deployment_id)
+    follow_up: Final = interactions_proxy.request(method, path, params=params, headers=headers)
+
+    assert create.status_code == 200, create.text
+    assert created[project].call_count == 1
+    assert follow_up.status_code == 200, follow_up.text
+    assert {name: route.call_count for name, route in followed_up.items()} == {
+        name: 1 if name == project else 0 for name in _SPLIT_DEPLOYMENTS.values()
+    }
+
+
+def test_a_key_allowed_the_group_reaches_the_named_deployment_although_the_group_prefers_another(
+    interactions_proxy: TestClient, respx_mock: respx.MockRouter
+) -> None:
+    upstream: Final = respx_mock.get(f"{_project_url('west-project')}/{_INTERACTION_ID}").mock(
+        return_value=httpx.Response(200, json=_INTERACTION)
+    )
+
+    with _cached_key(UserAPIKeyAuth(models=[_SPLIT_GROUP])) as authorization:
+        response: Final = interactions_proxy.get(
+            f"/v1beta/interactions/{_INTERACTION_ID}",
+            params={"model": "split-west"},
+            headers={"authorization": authorization},
+        )
+
+    assert response.status_code == 200, response.text
+    assert upstream.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("key", "teams", "deployment_id"),
+    (
+        pytest.param(UserAPIKeyAuth(models=[_VERTEX_DEEP_RESEARCH_GROUP]), (), "split-west", id="group-not-on-key"),
+        pytest.param(
+            UserAPIKeyAuth(team_id="team-without-split"),
+            (LiteLLM_TeamTableCachedObj(team_id="team-without-split", models=[_VERTEX_DEEP_RESEARCH_GROUP]),),
+            "split-west",
+            id="group-not-on-team",
+        ),
+        pytest.param(UserAPIKeyAuth(models=[_SPLIT_GROUP]), (), "no-such-deployment", id="unknown-deployment-id"),
+    ),
+)
+def test_a_follow_up_by_deployment_id_is_refused_when_the_key_cannot_call_its_group(
+    interactions_proxy: TestClient,
+    respx_mock: respx.MockRouter,
+    google_oauth: responses.RequestsMock,
+    key: UserAPIKeyAuth,
+    teams: tuple[LiteLLM_TeamTableCachedObj, ...],
+    deployment_id: str,
+) -> None:
+    with _cached_key(key, *teams) as authorization:
+        response: Final = interactions_proxy.get(
+            f"/v1beta/interactions/{_INTERACTION_ID}",
+            params={"model": deployment_id},
+            headers={"authorization": authorization},
+        )
+
+    assert response.status_code == 403, response.text
+    assert not respx_mock.calls
+    assert not google_oauth.calls
