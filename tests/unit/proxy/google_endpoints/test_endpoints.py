@@ -14,11 +14,12 @@ import responses
 import respx
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
-from pydantic import JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 from starlette.requests import Request
 from starlette.responses import Response
 
 import litellm
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.google_endpoints.endpoints import _google_count_tokens_request, google_count_tokens
@@ -399,10 +400,53 @@ def _deep_research_cost_from_the_vertex_row() -> float:
     )
 
 
-@pytest.mark.parametrize("model_group", (_VERTEX_DEEP_RESEARCH_GROUP, _VERTEX_GROUP))
-def test_routed_create_with_an_agent_sends_the_agent_with_the_deployment_credentials_and_bills_the_agent(
-    interactions_proxy: TestClient, respx_mock: respx.MockRouter, model_group: str
+class _LoggedRates(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    key: str
+    input_cost_per_token: float
+    cache_read_input_token_cost: float
+    output_cost_per_token: float
+
+
+class _LoggedModelMap(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    model_map_value: _LoggedRates
+
+
+class _LoggedPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    model: str
+    model_map_information: _LoggedModelMap
+
+
+class _PayloadRecorder(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.logged: Final = asyncio.Event()
+        self.payload: _LoggedPayload | None = None
+
+    async def async_log_success_event(
+        self, kwargs: Mapping[str, object], response_obj: object, start_time: object, end_time: object
+    ) -> None:
+        self.payload = _LoggedPayload.model_validate(kwargs["standard_logging_object"])
+        self.logged.set()
+
+
+@pytest.mark.parametrize(
+    ("model_group", "deployment_model"),
+    (
+        (_VERTEX_DEEP_RESEARCH_GROUP, f"vertex_ai/{_DEEP_RESEARCH_AGENT}"),
+        (_VERTEX_GROUP, "vertex_ai/gemini-4-argon"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_routed_create_with_an_agent_sends_the_agent_with_the_deployment_credentials_and_bills_the_agent(
+    interactions_proxy: TestClient, respx_mock: respx.MockRouter, model_group: str, deployment_model: str
 ) -> None:
+    recorder: Final = _PayloadRecorder()
     upstream: Final = respx_mock.post(_VERTEX_COLLECTION_URL).mock(
         return_value=httpx.Response(
             200,
@@ -416,10 +460,20 @@ def test_routed_create_with_an_agent_sends_the_agent_with_the_deployment_credent
         )
     )
 
-    response: Final = interactions_proxy.post(
-        "/v1beta/interactions",
-        json={"model": model_group, "agent": _DEEP_RESEARCH_AGENT, "input": "Compare grid-scale storage options."},
-    )
+    with pytest.MonkeyPatch.context() as callbacks:
+        callbacks.setattr(litellm, "callbacks", [recorder])
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=interactions_proxy.app), base_url="http://testserver"
+        ) as client:
+            response: Final = await client.post(
+                "/v1beta/interactions",
+                json={
+                    "model": model_group,
+                    "agent": _DEEP_RESEARCH_AGENT,
+                    "input": "Compare grid-scale storage options.",
+                },
+            )
+            await asyncio.wait_for(recorder.logged.wait(), timeout=10)
 
     assert response.status_code == 200, response.text
     assert json.loads(upstream.calls.last.request.content) == {
@@ -429,6 +483,15 @@ def test_routed_create_with_an_agent_sends_the_agent_with_the_deployment_credent
     assert upstream.calls.last.request.headers["authorization"] == "Bearer deployment-token"
     assert float(response.headers["x-litellm-response-cost"]) == pytest.approx(
         _deep_research_cost_from_the_vertex_row()
+    )
+    agent_row: Final = litellm.model_cost[f"vertex_ai/{_DEEP_RESEARCH_AGENT}"]
+    assert recorder.payload is not None
+    assert recorder.payload.model == deployment_model
+    assert recorder.payload.model_map_information.model_map_value == _LoggedRates(
+        key=f"vertex_ai/{_DEEP_RESEARCH_AGENT}",
+        input_cost_per_token=agent_row["input_cost_per_token"],
+        cache_read_input_token_cost=agent_row["cache_read_input_token_cost"],
+        output_cost_per_token=agent_row["output_cost_per_token"],
     )
 
 

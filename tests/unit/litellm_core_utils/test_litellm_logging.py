@@ -5678,6 +5678,65 @@ def test_reported_cost_respects_configured_pricing_and_additional_charges(
     assert logging_obj.model_call_details["standard_logging_object"]["response_cost"] == pytest.approx(expected)
 
 
+@pytest.mark.parametrize(
+    ("pricing_params", "expected_key"),
+    [
+        pytest.param({}, "vertex_ai/deep-research-preview-04-2026", id="default-pricing-logs-the-agent-row"),
+        pytest.param(
+            {"base_model": "vertex_ai/gemini-3.8-flash"}, "vertex_ai/gemini-3.8-flash", id="configured-base-model-wins"
+        ),
+        pytest.param(
+            {"input_cost_per_token": 3e-06, "output_cost_per_token": 9e-06},
+            "vertex_ai/gemini-4-argon",
+            id="custom-pricing-keeps-the-deployment",
+        ),
+    ],
+)
+def test_a_routed_agent_interaction_logs_the_agent_row_unless_the_deployment_sets_its_own_pricing(
+    pricing_params: Mapping[str, object], expected_key: str
+) -> None:
+    from litellm.types.interactions import InteractionsAPIResponse
+
+    agent: Final = "deep-research-preview-04-2026"
+    deployment: Final = "vertex_ai/gemini-4-argon"
+    started: Final = datetime_unit_test(2026, 1, 1, 12, 0, 0)
+    logging_obj: Final = LitellmLogging(
+        model=agent,
+        messages=[],
+        stream=False,
+        call_type="acreate_interaction",
+        start_time=started,
+        litellm_call_id="routed-agent-interaction",
+        function_id="routed-agent-interaction",
+    )
+    logging_obj.update_from_kwargs(
+        kwargs={},
+        litellm_params={**pricing_params, "metadata": {"deployment": deployment}},
+        optional_params={},
+        model=agent,
+        custom_llm_provider="vertex_ai",
+    )
+    response: Final = InteractionsAPIResponse(
+        id="interaction-dr", object="interaction", agent=agent, status="completed"
+    )
+    response.hidden_params["provider_response_model"] = agent
+
+    payload: Final = get_standard_logging_object_payload(
+        kwargs=logging_obj.model_call_details,
+        init_response_obj=response,
+        start_time=started,
+        end_time=started,
+        logging_obj=logging_obj,
+        status="success",
+    )
+
+    assert payload is not None
+    assert payload["model"] == deployment
+    model_map_value: Final = payload["model_map_information"]["model_map_value"]
+    assert model_map_value is not None
+    assert model_map_value["key"] == expected_key
+
+
 def test_process_hidden_params_preserves_zero_cost_in_hidden_params():
     """Pass-through handlers often set response_cost on result._hidden_params (including 0)."""
     from datetime import datetime

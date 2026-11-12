@@ -42,12 +42,6 @@ else:
 _JsonObject: TypeAlias = dict[str, object]
 
 
-def _priced_by_its_agent(response: InteractionsAPIResponse) -> InteractionsAPIResponse:
-    if response.agent:
-        response.hidden_params["provider_response_model"] = response.agent
-    return response
-
-
 def _has_agent_config_type(agent_config: object) -> bool:
     match agent_config:
         case {"type": str()}:
@@ -105,6 +99,13 @@ def _image_config_items(image_config: object) -> _ImageConfigItems:
 def _interaction_body(response: _InteractionPayloadSource) -> _InteractionPayload:
     """Decode the body of an Interactions API interaction response."""
     return response.json()
+
+
+def _interaction_response(raw_json: _InteractionPayload) -> InteractionsAPIResponse:
+    response: Final = InteractionsAPIResponse(**raw_json)
+    if response.agent:
+        response.hidden_params["provider_response_model"] = response.agent
+    return response
 
 
 def _cancel_body(response: _CancelPayloadSource) -> _CancelPayload:
@@ -307,7 +308,7 @@ class GoogleAIStudioInteractionsConfig(BaseInteractionsAPIConfig):
 
         verbose_logger.debug("Google AI Interactions response: %s", raw_json)
 
-        response: Final = _priced_by_its_agent(InteractionsAPIResponse(**raw_json))
+        response: Final = _interaction_response(raw_json)
         response.hidden_params["headers"] = dict(raw_response.headers)
         response.hidden_params["additional_headers"] = process_response_headers(dict(raw_response.headers))
 
@@ -361,7 +362,7 @@ class GoogleAIStudioInteractionsConfig(BaseInteractionsAPIConfig):
                 status_code=raw_response.status_code,
                 headers=dict(raw_response.headers),
             )
-        response: Final = _priced_by_its_agent(InteractionsAPIResponse(**raw_json))
+        response: Final = _interaction_response(raw_json)
         response.hidden_params["headers"] = dict(raw_response.headers)
         return response
 
