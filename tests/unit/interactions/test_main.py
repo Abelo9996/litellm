@@ -1068,7 +1068,7 @@ async def test_an_agent_only_vertex_deep_research_interaction_is_billed_under_th
     assert json.loads(route.calls.last.request.content) == {
         "agent": _DEEP_RESEARCH_AGENT,
         "input": "Compare grid-scale storage options.",
-        **({"stream": True} if stream else {}),
+        "stream": stream,
     }
     assert recorder.cost is not None
     assert recorder.cost.standard_logging_object.model == _DEEP_RESEARCH_AGENT
