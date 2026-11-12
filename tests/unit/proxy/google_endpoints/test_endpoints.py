@@ -10,8 +10,8 @@ from typing import Final
 
 import httpx
 import pytest
-import respx
 import responses
+import respx
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 from pydantic import JsonValue, ValidationError
@@ -30,9 +30,7 @@ from tests._master_key import MASTER_KEY
     ("system_key", "schema_key"),
     (("systemInstruction", "parameters"), ("system_instruction", "parametersJsonSchema")),
 )
-def test_google_count_tokens_translates_system_and_function_declarations(
-    system_key: str, schema_key: str
-) -> None:
+def test_google_count_tokens_translates_system_and_function_declarations(system_key: str, schema_key: str) -> None:
     schema: Final = {"type": "object", "properties": {"query": {"type": "string"}}}
     request_body: Final[dict[str, JsonValue]] = {
         "contents": [{"role": "user", "parts": [{"text": "Look this up"}]}],
@@ -69,9 +67,7 @@ def test_google_count_tokens_translates_system_and_function_declarations(
         ("parametersJsonSchema", {"type": "OBJECT", "properties": {"query": {"type": "STRING"}}}),
     ),
 )
-def test_google_count_tokens_normalizes_parameters_only(
-    schema_key: str, expected_schema: dict[str, JsonValue]
-) -> None:
+def test_google_count_tokens_normalizes_parameters_only(schema_key: str, expected_schema: dict[str, JsonValue]) -> None:
     request: Final = _google_count_tokens_request(
         "claude-sonnet",
         {
@@ -94,8 +90,8 @@ def test_google_count_tokens_normalizes_parameters_only(
 
     assert request.tools == [{"name": "lookup", "input_schema": expected_schema}]
 
-load_dotenv()
 
+load_dotenv()
 
 
 @pytest.mark.asyncio

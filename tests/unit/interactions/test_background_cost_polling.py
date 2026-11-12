@@ -1426,7 +1426,6 @@ async def test_create_on_a_replica_without_the_settlement_table_still_settles_in
         await task
 
 
-
 class _VirtualClock:
     def __init__(self) -> None:
         self.now: float = 0.0
