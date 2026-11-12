@@ -2022,10 +2022,14 @@ def test_get_model_from_request_authorizes_an_interaction_deployment_id_selector
         ]
     )
 
-    for params, headers in (({"model": selector}, None), (None, {"x-litellm-model": selector})):
+    for body, params, headers in (
+        ({}, {"model": selector}, None),
+        ({}, None, {"x-litellm-model": selector}),
+        ({"model": selector}, {"model": selector}, None),
+    ):
         assert (
             get_model_from_request(
-                request_data={}, route=route, request_query_params=params, request_headers=headers, llm_router=router
+                request_data=body, route=route, request_query_params=params, request_headers=headers, llm_router=router
             )
             == authorized_as
         )

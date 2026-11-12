@@ -607,18 +607,20 @@ def test_a_follow_up_by_the_created_deployment_id_reaches_the_project_that_holds
     }
 
 
+@pytest.mark.parametrize("selector", ("query", "header"))
 def test_a_key_allowed_the_group_reaches_the_named_deployment_although_the_group_prefers_another(
-    interactions_proxy: TestClient, respx_mock: respx.MockRouter
+    interactions_proxy: TestClient, respx_mock: respx.MockRouter, selector: str
 ) -> None:
     upstream: Final = respx_mock.get(f"{_project_url('west-project')}/{_INTERACTION_ID}").mock(
         return_value=httpx.Response(200, json=_INTERACTION)
     )
+    params, headers = _deployment_selector(selector, "split-west")
 
     with _cached_key(UserAPIKeyAuth(models=[_SPLIT_GROUP])) as authorization:
         response: Final = interactions_proxy.get(
             f"/v1beta/interactions/{_INTERACTION_ID}",
-            params={"model": "split-west"},
-            headers={"authorization": authorization},
+            params=params,
+            headers={**headers, "authorization": authorization},
         )
 
     assert response.status_code == 200, response.text
@@ -638,6 +640,7 @@ def test_a_key_allowed_the_group_reaches_the_named_deployment_although_the_group
         pytest.param(UserAPIKeyAuth(models=[_SPLIT_GROUP]), (), "no-such-deployment", id="unknown-deployment-id"),
     ),
 )
+@pytest.mark.parametrize("selector", ("query", "header"))
 def test_a_follow_up_by_deployment_id_is_refused_when_the_key_cannot_call_its_group(
     interactions_proxy: TestClient,
     respx_mock: respx.MockRouter,
@@ -645,12 +648,15 @@ def test_a_follow_up_by_deployment_id_is_refused_when_the_key_cannot_call_its_gr
     key: UserAPIKeyAuth,
     teams: tuple[LiteLLM_TeamTableCachedObj, ...],
     deployment_id: str,
+    selector: str,
 ) -> None:
+    params, headers = _deployment_selector(selector, deployment_id)
+
     with _cached_key(key, *teams) as authorization:
         response: Final = interactions_proxy.get(
             f"/v1beta/interactions/{_INTERACTION_ID}",
-            params={"model": deployment_id},
-            headers={"authorization": authorization},
+            params=params,
+            headers={**headers, "authorization": authorization},
         )
 
     assert response.status_code == 403, response.text

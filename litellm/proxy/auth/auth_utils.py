@@ -2695,9 +2695,12 @@ def _extract_model_candidates_from_request(
     uses_completion_model_sources: Final = _route_matches_any_marker(
         route=route, markers=_MODEL_ROUTING_COMPLETION_MODEL_ROUTE_MARKERS
     )
+    selects_by_interaction_id: Final = _route_matches_any_marker(route=route, markers=_INTERACTION_BY_ID_ROUTE_MARKERS)
 
     body_model: Final = request_data.get("model")
-    _append_model_candidates(candidates, body_model)
+    _append_model_candidates(
+        candidates, _group_of_deployment_selector(body_model, llm_router) if selects_by_interaction_id else body_model
+    )
     if uses_body_target_model_sources or not body_model:
         _append_model_candidates(candidates, request_data.get("target_model_names"))
     if _route_matches_any_marker(route=route, markers=_MODEL_ROUTING_SESSION_MODEL_ROUTE_MARKERS):
@@ -2709,9 +2712,6 @@ def _extract_model_candidates_from_request(
 
     if uses_model_routing_sources:
         if uses_header_or_query_model_sources:
-            selects_by_interaction_id: Final = _route_matches_any_marker(
-                route=route, markers=_INTERACTION_BY_ID_ROUTE_MARKERS
-            )
             for selector in (
                 _get_case_insensitive_mapping_value(request_query_params, "model"),
                 _get_case_insensitive_mapping_value(request_headers, MODEL_ROUTING_HEADER_NAME),
