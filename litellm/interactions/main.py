@@ -340,7 +340,7 @@ def create(
 
         litellm_logging_obj.update_from_kwargs(
             kwargs=kwargs,
-            model=model,
+            model=agent or model,
             optional_params=dict(optional_params),
             litellm_params={"litellm_call_id": litellm_call_id},
             custom_llm_provider=custom_llm_provider,

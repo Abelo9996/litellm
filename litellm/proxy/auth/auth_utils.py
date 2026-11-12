@@ -2423,12 +2423,14 @@ _MODEL_ROUTING_ROUTE_MARKERS: Final = (
     "/evals",
     "/fine_tuning",
     "/videos",
+    "/interactions/",
 )
 _MODEL_ROUTING_HEADER_OR_QUERY_ROUTE_MARKERS: Final = (
     "/files",
     "/batches",
     "/skills",
     "/evals",
+    "/interactions/",
 )
 _MODEL_ROUTING_QUERY_TARGET_MODEL_ROUTE_MARKERS: Final = (
     "/files",

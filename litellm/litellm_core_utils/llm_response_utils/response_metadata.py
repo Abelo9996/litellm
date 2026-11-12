@@ -10,6 +10,7 @@ from litellm.constants import LITELLM_DETAILED_TIMING
 from litellm.litellm_core_utils.core_helpers import get_litellm_metadata_from_kwargs, process_response_headers
 from litellm.litellm_core_utils.llm_response_utils.get_api_base import get_api_base
 from litellm.litellm_core_utils.logging_utils import LiteLLMLoggingObject
+from litellm.types.interactions import InteractionsAPIResponse
 from litellm.types.utils import (
     EmbeddingResponse,
     HiddenParams,
@@ -132,9 +133,16 @@ def _existing_provider_response_model(result: object) -> str | None:
 
 def _provider_response_model(result: object) -> str | None:
     """The model the provider answered with, kept because the proxy later rewrites ``result.model`` to the alias the
-    client asked for and cost-map lookups for the standard logging payload would otherwise miss."""
-    model: Final = getattr(result, "model", None) if isinstance(result, ModelResponse) else None
-    return model if isinstance(model, str) and model else None
+    client asked for and cost-map lookups for the standard logging payload would otherwise miss. An agent
+    interaction is served, and priced, by its agent rather than the model that only chose the deployment."""
+    match result:
+        case ModelResponse():
+            model: Final = getattr(result, "model", None)
+            return model if isinstance(model, str) and model else None
+        case InteractionsAPIResponse(agent=str(agent)) if agent:
+            return agent
+        case _:
+            return None
 
 
 class ResponseMetadata:
